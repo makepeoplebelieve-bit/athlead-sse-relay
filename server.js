@@ -14,14 +14,13 @@ if (!REDIS_URL) {
 }
 
 // ── In-memory state ──────────────────────────────────────────
-// eventId → Set<res> — connected SSE clients per event
 const clients = new Map();
-// eventId → last published message string (for instant initial state)
 const lastMessage = new Map();
-// eventId → subscribed to Redis Pub/Sub?
 const subscribed = new Set();
+const computeTimers = new Map();
+const COMPUTE_INTERVAL_MS = 2000;
 
-// ── Redis Pub/Sub subscriber (1 per relay instance) ─────────
+// ── Redis Pub/Sub subscriber ─────────────────────────────────
 const sub = new Redis(REDIS_URL);
 sub.on("error", (e) => console.error("Redis subscriber error:", e.message));
 
@@ -55,10 +54,30 @@ function maybeUnsubscribe(eventId) {
     sub.unsubscribe(`live:${eventId}`);
     lastMessage.delete(eventId);
     clients.delete(eventId);
+    if (computeTimers.has(eventId)) {
+      clearInterval(computeTimers.get(eventId));
+      computeTimers.delete(eventId);
+    }
   }
 }
 
-// ── SSE endpoint for browsers ────────────────────────────────
+// ── Periodic computeGroups trigger ────────────────────────────
+function ensureComputeTimer(eventId) {
+  if (computeTimers.has(eventId)) return;
+  const trigger = async () => {
+    try {
+      await fetch(`${BASE44_API_URL}/functions/computeGroups`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event_id: eventId }),
+      });
+    } catch (_e) {}
+  };
+  trigger();
+  computeTimers.set(eventId, setInterval(trigger, COMPUTE_INTERVAL_MS));
+}
+
+// ── SSE endpoint ─────────────────────────────────────────────
 app.get("/sse/:eventId", async (req, res) => {
   const { eventId } = req.params;
 
@@ -67,15 +86,13 @@ app.get("/sse/:eventId", async (req, res) => {
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "Access-Control-Allow-Origin": "*",
-    "X-Accel-Buffering": "no", // disable Nginx/Proxy buffering
+    "X-Accel-Buffering": "no",
   });
 
-  // 1. Send cached message immediately if available (no Base44 fetch needed)
   const cached = lastMessage.get(eventId);
   if (cached) {
     res.write(`data: ${cached}\n\n`);
   } else {
-    // First client for this event on this instance — fetch initial state
     try {
       const r = await fetch(`${BASE44_API_URL}/functions/getCachedGroups`, {
         method: "POST",
@@ -91,19 +108,18 @@ app.get("/sse/:eventId", async (req, res) => {
     } catch (_e) {}
   }
 
-  // 2. Register client + subscribe to Redis Pub/Sub
   if (!clients.has(eventId)) clients.set(eventId, new Set());
+  const isFirstClient = clients.get(eventId).size === 0;
   clients.get(eventId).add(res);
   ensureSubscribed(eventId);
+  if (isFirstClient) ensureComputeTimer(eventId);
 
-  // 3. Heartbeat every 15s (keeps proxies alive, detects dead connections)
   const hb = setInterval(() => {
     if (!res.writableEnded) {
       try { res.write(`: heartbeat\n\n`); } catch (_e) {}
     }
   }, 15000);
 
-  // 4. Cleanup on disconnect
   req.on("close", () => {
     clearInterval(hb);
     const set = clients.get(eventId);
@@ -114,13 +130,14 @@ app.get("/sse/:eventId", async (req, res) => {
   });
 });
 
-// ── Health endpoint (for Fly.io auto-scaler + monitoring) ─────
+// ── Health endpoint ──────────────────────────────────────────
 app.get("/health", (req, res) => {
   const connCount = [...clients.values()].reduce((s, set) => s + set.size, 0);
   res.json({
     status: "ok",
     connections: connCount,
     events: clients.size,
+    active_compute_timers: computeTimers.size,
     capacity: connCount < 3000,
   });
 });
