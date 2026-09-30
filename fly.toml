@@ -1,6 +1,6 @@
-# fly.toml app configuration file generated for athlead-sse-relay on 2026-09-24T16:32:04Z
+# fly.toml app configuration file generated for athlead-sse-relay on 2026-09-30T08:26:26Z
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
 #
 
 app = 'athlead-sse-relay'
@@ -12,24 +12,22 @@ primary_region = 'ams'
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'off'
+  auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 2
-
-  [http_service.concurrency]
-    type = 'connections'
-    hard_limit = 3500
-    soft_limit = 2500
-
-  [[http_service.checks]]
-    interval = '10s'
-    timeout = '2s'
-    grace_period = '5s'
-    method = 'GET'
-    path = '/health'
+  checks = [{ grace_period = '5s', interval = '10s', method = 'GET', path = '/health', timeout = '2s' }]
+  concurrency = { hard_limit = 3500, soft_limit = 2500, type = 'connections' }
 
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 2
+  memory_mb = 512
+  processes = ['app']
+  size = 'shared-cpu-2x'
