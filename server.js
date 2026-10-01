@@ -5,11 +5,11 @@ import Redis from "ioredis";
 //
 // Primary path: computeGroups (triggered by MQTT bridge or watchdog) publishes
 // to Redis Pub/Sub → relay fans out to all SSE clients.
-// Watchdog: if no Pub/Sub message is received for > SILENCE_THRESHOLD_MS, the
-// relay starts a compute timer as fallback. When Pub/Sub resumes, the watchdog
-// stops automatically. This eliminates redundant computeGroups calls when
-// Pub/Sub is active (e.g. MQTT bridge triggers computeGroups), while
-// guaranteeing data flow when Pub/Sub is silent or misconfigured.
+// The MQTT bridge is the primary compute trigger (debounced 3s per event).
+// The relay watchdog is a fallback: it runs every 3s but skips when Pub/Sub
+// is active (bridge working). It keeps running after the last client leaves
+// so computation stays continuous without viewers, and auto-stops after 60s
+// of no activity.
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -25,10 +25,10 @@ const lastMessage = new Map();     // eventId → last JSON string
 const lastPubSubTs = new Map();    // eventId → last Pub/Sub message timestamp (ms)
 const subscribed = new Set();      // eventId → subscribed to Pub/Sub?
 const computeTimers = new Map();   // eventId → interval handle (watchdog compute)
-const watchdogTimers = new Map();  // eventId → interval handle (silence monitor)
 const computeInFlight = new Set(); // eventId → bool (prevent overlap)
+const staleCounts = new Map();     // eventId → consecutive zero-active ticks
+const STALE_TICK_THRESHOLD = 20;   // 20 × 3s = 60s of no activity → auto-stop
 const COMPUTE_INTERVAL_MS = 3000;
-const SILENCE_THRESHOLD_MS = 5000; // start watchdog after 5s of Pub/Sub silence
 
 // ── Event loop lag monitor ───────────────────────────────────
 // Detects when the synchronous fan-out (forwardToClients) blocks too long.
@@ -53,8 +53,9 @@ if (sub) {
     lastMessage.set(eventId, msg);
     lastPubSubTs.set(eventId, Date.now());
     forwardToClients(eventId, msg);
-    // Pub/Sub active — stop watchdog compute timer if running
-    stopWatchdog(eventId);
+    // Don't stop the watchdog — it self-skips when Pub/Sub is active (bridge
+    // triggering computeGroups). This keeps a steady 3s cadence instead of
+    // the 5s restart cycle that happened when we stopped on every Pub/Sub.
   });
 }
 
@@ -69,15 +70,10 @@ function ensureSubscribed(eventId) {
 function maybeUnsubscribe(eventId) {
   const set = clients.get(eventId);
   if (!set || set.size === 0) {
-    if (sub) {
-      subscribed.delete(eventId);
-      sub.unsubscribe(`live:${eventId}`);
-    }
     clients.delete(eventId);
-    lastMessage.delete(eventId);
-    lastPubSubTs.delete(eventId);
-    stopWatchdogMonitor(eventId);
-    computeInFlight.delete(eventId);
+    // Watchdog keeps running — computation continues without SSE clients,
+    // keeping rideridx + GPS trail continuous. The watchdog auto-stops after
+    // 60s of no activity and cleans up Pub/Sub + cached state itself.
   }
 }
 
@@ -93,11 +89,20 @@ function forwardToClients(eventId, msg) {
   }
 }
 
-// ── Watchdog compute timer (fallback when Pub/Sub is silent) ──
-function startWatchdog(eventId) {
+// ── Watchdog compute timer ──────────────────────────────────
+// Runs every 3s. Skips when Pub/Sub is active (bridge triggers computeGroups).
+// Auto-stops after 60s of no activity (0 active riders) to prevent leaks.
+// Keeps running after the last SSE client disconnects so computation
+// continues without viewers — rideridx + GPS trail stay continuous.
+function ensureWatchdog(eventId) {
   if (computeTimers.has(eventId)) return;
 
   const trigger = async () => {
+    // Skip when Pub/Sub is active — the bridge is triggering computeGroups,
+    // so the watchdog is not needed. Keeps a 3s cadence (bridge debounce)
+    // instead of the old 5s restart cycle.
+    const lastPub = lastPubSubTs.get(eventId) || 0;
+    if (lastPub > 0 && Date.now() - lastPub < COMPUTE_INTERVAL_MS) return;
     if (computeInFlight.has(eventId)) return;
     computeInFlight.add(eventId);
     try {
@@ -110,10 +115,16 @@ function startWatchdog(eventId) {
       const data = await r.json();
       const msg = JSON.stringify(data);
       lastMessage.set(eventId, msg);
-      // Direct forward — reliable even if Pub/Sub is broken.
-      // computeGroups also publishes to Pub/Sub; if that path works,
-      // the relay will receive it and stop this watchdog.
       forwardToClients(eventId, msg);
+
+      // Auto-stop after 60s of no activity (no riders, no finished)
+      if (data.total_active === 0 && data.total_finished === 0) {
+        const count = (staleCounts.get(eventId) || 0) + 1;
+        staleCounts.set(eventId, count);
+        if (count >= STALE_TICK_THRESHOLD) stopWatchdog(eventId);
+      } else {
+        staleCounts.delete(eventId);
+      }
     } catch (_e) {
       // silent — next tick will retry
     } finally {
@@ -130,31 +141,16 @@ function stopWatchdog(eventId) {
     clearInterval(computeTimers.get(eventId));
     computeTimers.delete(eventId);
   }
-}
-
-// ── Silence monitor — starts watchdog when Pub/Sub goes quiet ──
-function ensureWatchdogMonitor(eventId) {
-  if (watchdogTimers.has(eventId)) return;
-
-  const check = () => {
-    const last = lastPubSubTs.get(eventId) || 0;
-    if (last === 0 || Date.now() - last > SILENCE_THRESHOLD_MS) {
-      // Pub/Sub silent — start watchdog compute timer
-      startWatchdog(eventId);
-    }
-  };
-
-  // Check immediately and every 2s
-  check();
-  watchdogTimers.set(eventId, setInterval(check, 2000));
-}
-
-function stopWatchdogMonitor(eventId) {
-  if (watchdogTimers.has(eventId)) {
-    clearInterval(watchdogTimers.get(eventId));
-    watchdogTimers.delete(eventId);
+  staleCounts.delete(eventId);
+  // Clean up Pub/Sub subscription + cached state when watchdog stops
+  if (sub) {
+    subscribed.delete(eventId);
+    sub.unsubscribe(`live:${eventId}`);
   }
-  stopWatchdog(eventId);
+  clients.delete(eventId);
+  lastMessage.delete(eventId);
+  lastPubSubTs.delete(eventId);
+  computeInFlight.delete(eventId);
 }
 
 // ── SSE endpoint for browsers ────────────────────────────────
@@ -195,7 +191,7 @@ app.get("/sse/:eventId", async (req, res) => {
   const isFirstClient = clients.get(eventId).size === 0;
   clients.get(eventId).add(res);
   ensureSubscribed(eventId);
-  if (isFirstClient) ensureWatchdogMonitor(eventId);
+  if (isFirstClient) ensureWatchdog(eventId);
 
   // 3. Heartbeat every 15s
   const hb = setInterval(() => {
